@@ -1,0 +1,231 @@
+\documentclass[times,11pt]{article}
+\usepackage{color,verbatim}
+
+\begin{document}
+\section{Introduction}
+Applications that accept user input--from forum software to shopping carts--are vulnerable to injection attacks like SQL injection, path traversal and cross site scripting (XSS). We can address these vulnerabilities by detecting and properly handling attacks.
+
+Taint-tracking is aimed at detecting these attacks by keeping whether each string is derived from user input (``tainted''). In such a scheme, all user input is marked tainted, and all strings derived from tainted strings are also marked tainted. Then, the sensitive strings are checked at a sink--such as a SQL query parser--so that unsanitized strings will be rejected.
+
+Tracking taint information at the string level is simple and efficient--it requires a simple \verb|boolean| field to each string--but it results in too many false positives. For example, the SQL query \texttt{SELECT * FROM users WHERE firstname=`\underline{John}'} (the underlined portion denotes user input) would be considered dangerous although control characters are not from user input. Thus, it is important to also track which portions of the string are tainted in addition to which strings are tainted.
+
+Erika Chin's work on character-level taint tracking addresses that shortcoming by tracking taint information on a finer granularity. However, it suffers from one major obstacle--performance. Her implementation of taint-tracking using a boolean array incurs a significant overhead on some user requests. We aim to address that by representing taint differently.
+
+Our goal is to optimize the process of propagating, storing and testing taint information for the common case, but maintain the character-level granularity. Our hypothesis of what constitutes the common case is derived from experimenting with and analyzing JForum, a web discussion software based on Java Server Pages. We will evaluate the hypothesis by profiling JForum, and obtain rigorous micro- and macro-benchmarking results. Like Chin's work, this focuses on Java/Tomcat, but the results are relevant to many other server implementations.
+\section{Our Hypothesis: Motivation for Optimizations}
+Our hypothesis is that most strings are either untainted, or have a single taint interval, and therefore we should optimize for that. The theoretical basis for the hypothesis rests on the fact that the initial taint properties are very simple (tainted or untainted) and that there are very few ways to increase the number of taint intervals (`complexity').
+
+All user input is fully tainted at the source. All strings extracted from the user request are fully tainted, and all other strings (not derived from tainted strings) are considered untainted. For example, if `\texttt{\underline{John}}' is the value for the parameter \texttt{firstname} (from the user request), the entire string is considered tainted.
+
+Concatenating an untainted string with a string with a single taint interval results in a string with a single interval. For example, concatenating `\texttt{My name is }' with `\texttt{\underline{John}}' results in `\texttt{My name is \underline{John}}', which still only has a single taint interval.
+
+All substrings of strings with a single taint interval also have at most one taint interval. For example, a substring of `\texttt{My name is \underline{John}}' may be `\texttt{My name}' or `\texttt{is \underline{John}}'.
+
+The taint properties can only become complex through concatenation of two tainted strings, or through string replacement (which can be transformed into a call to substring followed by a serial concatenation). For example, concatenating `\texttt{My name is \underline{John} }' and `\texttt{\underline{Smith}}' will result in a string with complex taint properties (`\texttt{My name is \underline{John} \underline{Smith}}') while concatenating `\texttt{Your suggested username is \underline{John}}' and `\texttt{\underline{Smith}}' will result in another string with a single taint interval (`\texttt{Your suggested username is \underline{JohnSmith}}').
+
+However, not all strings have such simple taint properties. Such strings are necessarily a result of many concatenations or string replacements (which are uncommon). Therefore, they tend to be longer than untainted strings and strings with single taint intervals.
+
+These strings may have an unbounded number of taint intervals, and must be handled gracefully. For example, an implementation of taint tracking using an interval set as the data structure would quickly succumb to a pathological case like the following:			
+	\begin{verbatim}
+	for (String s : user_input)
+	  list += s + ","; // s is fully tainted but the comma is not
+	\end{verbatim}
+
+Our method of representation must exploit the simplicity of most strings while properly handling less common cases where the string may have an arbitrary number of taint intervals.
+\section{Representation: TaintSet Data Structure}
+The taint information is represented in the TaintSet data structure either as an interval--when that is sufficient--or as a bitmap. The dual-representation allows for both performance when possible, and flexibility in general.
+
+The former representation covers a majority of strings, and it is extremely efficient because interval arithmetic is simple. The latter representation covers the strings with more complex taint properties, and it is extremely compact and efficient because doing group operations on bitmaps is faster than manipulating individual boolean array elements.
+\section{Implementation}
+All \texttt{String}s, \texttt{StringBuffer}s and \texttt{StringBuilder}s are given an additional field `\texttt{taintvalues}' of type \texttt{TaintSet} that represents the string's taint properties. This value is \texttt{null} if the string is untainted--which is the case for most strings.
+
+We further optimize the storage and performance by adding a constant \texttt{TaintSet} object named \texttt{allTainted} to the class. This will allow us to avoid instantiating new \texttt{TaintSet} objects for all fully-tainted strings, saving both time and space. Thus, \texttt{taintvalues = TaintSet.allTainted} if the corresponding string is fully tainted.
+
+For strings with other taint patterns, 
+\section{Outline}
+	\begin{enumerate}
+	\item Introduction
+	\item Basic Implementation
+		\begin{enumerate}
+		\item Modifications to String Class
+		\item Source Tainting and propagation
+		\end{enumerate}
+	\item Profiling
+		\begin{enumerate}
+		\item Measuring taint properties of Strings
+			\begin{enumerate}
+			\item Measure the number of taint intervals of strings in calls to string methods
+			\item Histogram based on use (invocation of the listed methods) not existence or creation
+			\item Retrofitted Erika's code because counting distinct intervals in boolean arrays easier
+			\end{enumerate}
+		\item Measuring frequency of method calls
+			\begin{enumerate}
+			\item Updated static hash table with each call to a retrofitted String method
+			\item Goal: Determine where to focus optimizations
+			\end{enumerate}
+		\item Methodology and Details
+			\begin{enumerate}
+			\item Track calls to the following methods in String
+				\begin{enumerate}
+				\item \texttt{replace(CharSequence, CharSequence)}
+				\item \texttt{substring(int, int)}
+				\item \texttt{substring(int)}
+				\item \texttt{toLowerCase(Locale)}
+				\item \texttt{toUpperCase(Locale)}
+				\item \texttt{trim()}
+				\item \texttt{concat(String)}
+				\item \texttt{matches(String)}
+				\item \texttt{split(String, int)}
+				\item \texttt{split(String)}
+				\item \texttt{replaceAll(String, String)}
+				\item \texttt{replaceFirst(String, String)}
+				\end{enumerate}
+			\item Static methods in String: Upon first invocation, start a ``logger'' thread that periodically writes to log files
+				\begin{itemize}
+				\item No synchronization tools (``synchronized'') is used because the cost of a loss of a couple counts is minor
+				\end{itemize}
+			\item Performed a sequence of actions on JForum running on a server with a retrofitted String class:
+				\begin{enumerate}
+				\item Visit the home page
+				\item Click on a forum to view its index page
+				\item Click on a topic with many posts
+				\item Click reply
+				\item Post reply
+				\end{enumerate}
+			\item Inspected log file after each action and kept track of changes
+			\end{enumerate}
+		\item Results
+			\begin{enumerate}
+			\item Method Calls
+			
+				\begin{tabular}{l|ccccc} 
+				\hline
+					\textbf{Method} & \textbf{A} & \textbf{B} & \textbf{C} & \textbf{D} & \textbf{E} \\ 
+				\hline
+					replace				& 0	& 0	& 0	& 0	& 0 \\
+					substring			& 1825	& 6765	& 4619	& 136	& 4697 \\
+					toLowerCase		& 78	& 885	& 734	& 20	& 996 \\
+					toUpperCase		& 1	& 12	& 13	& 0	& 10 \\
+					trim					& 1533	& 1111	& 2	& 0	& 144 \\
+					concat				& 99	& 234	& 0	& 0	& 112 \\
+					matches				& 0	& 0	& 0	& 0	& 0 \\
+					split					& 0	& 0	& 0	& 0	& 0 \\
+					replaceAll		& 0	& 0	& 0	& 0	& 0 \\
+					replaceFirst	& 0	& 0	& 0	& 0	& 0 \\
+				\hline
+				\end{tabular} 
+			\item Taint histogram
+			
+				\begin{tabular}{l|ccccc} 
+				\hline
+					\textbf{Taint Interval Counts} & \textbf{A} & \textbf{B} & \textbf{C} & \textbf{D} & \textbf{E} \\ 
+				\hline
+					0	& 3733	& 11481	& 7563	& 156	& 7577 \\
+					1	& 11	& 11	& 13	& 0	& 76 \\
+					More than 1	& 0	& 0	& 0	& 0	& 0 \\
+				\hline
+				\end{tabular}
+			\end{enumerate}
+		\item Future work
+			\begin{enumerate}
+			\item Track StringBuffer/StringBuilder. Possible explanation: Most concatenation invocations are from Buffer/Builder (For example, the automatic conversion of + to append calls)
+			\item Track taint histogram for each method. Perhaps the calls to substring() are not problematic despite the sheer count because those calls typically are on untainted Strings.
+			\end{enumerate}
+		\end{enumerate}
+	\item Testing Methodology and Benchmarks
+		\begin{enumerate}
+		\item Test Setup
+			\begin{enumerate}
+			\item running on gradgrind \textcolor{green}{* get stats *}
+			\item consistent machine for both micro and macro tests
+			\end{enumerate}
+		\item Microbenchmarking
+			\begin{enumerate}
+			\item Methodology
+				\begin{enumerate}
+				\item Testing for steady state since servers will be in such a 
+					state
+				\item Using Benchmark framework \textcolor{green}{* cite source *}
+					\begin{itemize}
+					\item Run framework for x (determine actual number) runs and average 
+						over those runs
+					\item Framework automatically runs until steady state per test
+					\item Each run is another instantiation of the VM running a set of 
+						tests until steady state/test
+					\end{itemize}
+				\item Tested from command line, switched out VMs to test 
+					different versions
+					\begin{itemize}
+					\item IBM-JAVA
+					\item Basic Implementation (Erika)
+					\item Set Version
+					\end{itemize}
+				\item Test various string class methods
+					\begin{itemize}
+					\item String Creation
+					\item Concatenation
+					\item Substring
+					\item Trim
+					\item Case Changing
+					\item Replacement
+					\end{itemize}
+				\item Test Various length strings
+					\begin{itemize}
+					\item 12
+					\item 1024
+					\end{itemize}
+				\item Test Various taint versions for taint-capable VMs
+					\begin{itemize}
+					\item No taint
+					\item full taint
+					\item 1/2 taint
+					\item 2/3 taint
+					\end{itemize}
+				\end{enumerate}
+			\end{enumerate}
+		\item Benchmarks
+			\begin{enumerate}
+			\item \textcolor{blue}{* show them *}
+			\item Remarks
+				\begin{enumerate}
+				\item Explanation for beating ibm-java in certain cases...
+				\end{enumerate}
+			\end{enumerate}
+		\item Macrobenchmarking
+			\begin{enumerate}
+			\item Methodology - Latency Testing
+				\begin{enumerate}
+				\item Measure time from receiving request to finish servicing 
+					request
+				\item Use JForum to simulate webapp with medium reading to 
+					writing load
+				\item Testing POST/GET requests on a pre-populated JForum 
+					database
+				\item Server to Server on LAN \textcolor{blue}{* what is capable speed? *}
+				\item Client:
+					\begin{itemize}
+					\item Server with a python script being invoked from the command line
+					\end{itemize}
+				\item Server:
+					\begin{itemize}
+					\item Server running Tomcat instances with a JForum application (only
+						one running at a time)
+					\item One version is standard Tomcat6 running IBM-JAVA, other is a 
+						modified version to
+					\item Taint sources running either Erika's VM or the TaintSet VM
+					\item Mysql instance to handle database requests
+					\end{itemize}
+				\end{enumerate}
+			\item Benchmarks
+				\begin{enumerate}
+				\item \textcolor{magenta}{* show them *}
+				\end{enumerate}
+			\end{enumerate}
+		\end{enumerate}
+	\item Conclusions/Future Work
+		\begin{enumerate}
+		\item Uppercase/lowercase
+		\item More comprehensive macrobenchmarks
+		\end{enumerate}
+	\end{enumerate}
+\end{document}
